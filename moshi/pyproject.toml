@@ -22,10 +22,25 @@ readme = "README.md"
 [project.scripts]
 moshi-server = "moshi.server:main"
 moshi-offline = "moshi.offline:main"
+personaplex-eval = "moshi.evaluate.evaluate:main"
+personaplex-eval-bench = "moshi.evaluate.run_bench:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "moshi.__version__"}
 
+[tool.setuptools.package-data]
+"moshi.evaluate.judge.assets" = ["*.json"]
+
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+eval = [
+    "torchaudio",
+    "silero-vad",
+    "scipy",
+    "nemo_toolkit[asr]",
+    "openai",
+    "tqdm",
+]

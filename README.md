@@ -92,6 +92,21 @@ python -m moshi.offline \
   --output-text "output.json"
 ```
 
+### FullDuplexBench duplex scoring
+
+PersonaPlex includes the same duplex judges as Moshi (pause, backchannel, turn taking,
+user interruption). Generation uses offline PersonaPlex with the README prompts.
+See [`moshi/moshi/evaluate/README.md`](moshi/moshi/evaluate/README.md):
+
+```bash
+pip install -e "moshi/.[eval]"
+python -m moshi.evaluate.run_bench \
+  --bench-root /path/to/fullduplex_bench \
+  --results-root results/fullduplex_personaplex \
+  --voice-prompt NATF2.pt
+python -m moshi.evaluate.evaluate --results-root results/fullduplex_personaplex
+```
+
 ## Voices
 
 PersonaPlex supports a wide range of voices; we pre-package embeddings for voices that sound more natural and conversational (NAT) and others that are more varied (VAR). The fixed set of voices are labeled:

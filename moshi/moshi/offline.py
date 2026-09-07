@@ -150,6 +150,183 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
     return str(voices_dir)
 
 
+class OfflineSession:
+    """Loaded PersonaPlex offline models reusable across multiple wav samples."""
+
+    def __init__(
+        self,
+        mimi: MimiModel,
+        other_mimi: MimiModel,
+        lm_gen: LMGen,
+        text_tokenizer: sentencepiece.SentencePieceProcessor,
+        device: str,
+    ):
+        self.mimi = mimi
+        self.other_mimi = other_mimi
+        self.lm_gen = lm_gen
+        self.text_tokenizer = text_tokenizer
+        self.device = device
+
+
+def load_offline_session(
+    tokenizer_path: Optional[str],
+    moshi_weight: Optional[str],
+    mimi_weight: Optional[str],
+    hf_repo: str,
+    device: str,
+    seed: Optional[int],
+    temp_audio: float,
+    temp_text: float,
+    topk_audio: int,
+    topk_text: int,
+    greedy: bool,
+    save_voice_prompt_embeddings: bool = False,
+    cpu_offload: bool = False,
+) -> OfflineSession:
+    """Load Mimi + Moshi LM, warm up, return a session for repeated sample generation."""
+    if seed is not None and seed != -1:
+        seed_all(seed)
+
+    # Download config.json to increment download counter
+    # No worries about double-counting since config.json will be cached the second time
+    hf_hub_download(hf_repo, "config.json")
+
+    log("info", "loading mimi")
+    if mimi_weight is None:
+        mimi_weight = hf_hub_download(hf_repo, loaders.MIMI_NAME)  # type: ignore
+    mimi = loaders.get_mimi(mimi_weight, device)
+    other_mimi = loaders.get_mimi(mimi_weight, device)
+    log("info", "mimi loaded")
+
+    if tokenizer_path is None:
+        tokenizer_path = hf_hub_download(hf_repo, loaders.TEXT_TOKENIZER_NAME)  # type: ignore
+    text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)  # type: ignore
+
+    log("info", "loading moshi")
+    if moshi_weight is None:
+        moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)  # type: ignore
+    lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=cpu_offload)
+    lm.eval()
+    log("info", "moshi loaded")
+
+    frame_size = int(mimi.sample_rate / mimi.frame_rate)
+    lm_gen = LMGen(
+        lm,
+        audio_silence_frame_cnt=int(0.5 * mimi.frame_rate),  # spacer after prompts
+        sample_rate=mimi.sample_rate,
+        device=device,
+        frame_rate=mimi.frame_rate,
+        save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+        use_sampling=not greedy,
+        temp=temp_audio,
+        temp_text=temp_text,
+        top_k=topk_audio,
+        top_k_text=topk_text,
+    )
+    mimi.streaming_forever(1)
+    other_mimi.streaming_forever(1)
+    lm_gen.streaming_forever(1)
+
+    log("info", "warming up the model")
+    warmup(mimi, other_mimi, lm_gen, device, frame_size)
+
+    return OfflineSession(mimi, other_mimi, lm_gen, text_tokenizer, device)
+
+
+def generate_offline_sample(
+    session: OfflineSession,
+    input_wav: str,
+    output_wav: str,
+    text_prompt: str,
+    voice_prompt_path: str,
+    output_text: Optional[str] = None,
+    log_tokens: bool = True,
+) -> List[str]:
+    """Run one user-wav → agent-wav generation on an already-loaded session.
+
+    Returns the list of decoded text pieces (including special-token labels).
+    """
+    mimi = session.mimi
+    other_mimi = session.other_mimi
+    lm_gen = session.lm_gen
+    text_tokenizer = session.text_tokenizer
+
+    if voice_prompt_path.endswith(".pt"):
+        lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+    else:
+        lm_gen.load_voice_prompt(voice_prompt_path)
+    lm_gen.text_prompt_tokens = (
+        text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if len(text_prompt) > 0 else None
+    )
+
+    mimi.reset_streaming()
+    other_mimi.reset_streaming()
+    lm_gen.reset_streaming()
+    lm_gen.step_system_prompts(mimi)
+    mimi.reset_streaming()
+
+    sample_rate = mimi.sample_rate
+    user_audio = lm_load_audio(input_wav, sample_rate)
+
+    generated_frames: List[np.ndarray] = []
+    generated_text_tokens: List[str] = []
+    total_target_samples = user_audio.shape[-1]
+
+    for user_encoded in lm_encode_from_sphn(
+        mimi,
+        lm_iterate_audio(
+            user_audio, sample_interval_size=lm_gen._frame_size, pad=True
+        ),
+        max_batch=1,
+    ):
+        steps = user_encoded.shape[-1]
+        for c in range(steps):
+            step_in = user_encoded[:, :, c : c + 1]
+            tokens = lm_gen.step(step_in)
+            if tokens is None:
+                continue
+            pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
+            generated_frames.append(pcm)
+            text_token = tokens[0, 0, 0].item()
+            if text_token not in (0, 3):
+                _text = text_tokenizer.id_to_piece(text_token)  # type: ignore
+                _text = _text.replace("▁", " ")
+                if log_tokens:
+                    log("info", f"text token '{_text}'")
+                generated_text_tokens.append(_text)
+            else:
+                text_token_map = ["EPAD", "BOS", "EOS", "PAD"]
+                label = text_token_map[text_token]
+                if log_tokens:
+                    log("info", f"text token '{label}'")
+                generated_text_tokens.append(label)
+
+    if len(generated_frames) == 0:
+        log("error", "No audio frames were generated. Check input file and configuration.")
+        return []
+
+    output_pcm = np.concatenate(generated_frames, axis=-1)
+    if output_pcm.shape[-1] > total_target_samples:
+        output_pcm = output_pcm[:total_target_samples]
+    elif output_pcm.shape[-1] < total_target_samples:
+        pad_len = total_target_samples - output_pcm.shape[-1]
+        output_pcm = np.concatenate(
+            [output_pcm, np.zeros(pad_len, dtype=output_pcm.dtype)], axis=-1
+        )
+
+    Path(output_wav).parent.mkdir(parents=True, exist_ok=True)
+    sphn.write_wav(output_wav, output_pcm, sample_rate)
+    log("info", f"Wrote output audio to {output_wav}")
+
+    if output_text is not None:
+        Path(output_text).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_text, "w", encoding="utf-8") as file:
+            json.dump(generated_text_tokens, file, ensure_ascii=False)
+        log("info", f"Wrote output text to {output_text}")
+
+    return generated_text_tokens
+
+
 def run_inference(
     input_wav: str,
     output_wav: str,
@@ -172,150 +349,32 @@ def run_inference(
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
-    - Loads/initializes models and tokenizer
-    - Warms up execution
-    - Loads system text tokens and voice prompt
-    - Runs prompt phases (text + voice + silences) via LMGen.step_system_prompts
-    - Streams the user WAV frames into the input channels and samples model outputs
-    - Decodes and writes an output WAV of the same duration
+    Loads models once, then generates a single sample (CLI entry path).
     """
-    if seed is not None and seed != -1:
-        seed_all(seed)
-
-    # Download config.json to increment download counter
-    # No worries about double-counting since config.json will be cached the second time
-    hf_hub_download(hf_repo, "config.json")
-
-    # 1) Load Mimi encoders/decoders (same as server.py)
-    log("info", "loading mimi")
-    if mimi_weight is None:
-        mimi_weight = hf_hub_download(hf_repo, loaders.MIMI_NAME)  # type: ignore
-    mimi = loaders.get_mimi(mimi_weight, device)
-    other_mimi = loaders.get_mimi(mimi_weight, device)
-    log("info", "mimi loaded")
-
-    # 2) Load tokenizer
-    if tokenizer_path is None:
-        tokenizer_path = hf_hub_download(hf_repo, loaders.TEXT_TOKENIZER_NAME)  # type: ignore
-    text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)  # type: ignore
-
-    # 3) Load Moshi LM and eval mode
-    log("info", "loading moshi")
-    if moshi_weight is None:
-        moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)  # type: ignore
-    lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=cpu_offload)
-    lm.eval()
-    log("info", "moshi loaded")
-
-    # 4) Construct LMGen like server.py's ServerState does
-    frame_size = int(mimi.sample_rate / mimi.frame_rate)
-    lm_gen = LMGen(
-        lm,
-        audio_silence_frame_cnt=int(0.5 * mimi.frame_rate),  # spacer after prompts
-        sample_rate=mimi.sample_rate,
+    session = load_offline_session(
+        tokenizer_path=tokenizer_path,
+        moshi_weight=moshi_weight,
+        mimi_weight=mimi_weight,
+        hf_repo=hf_repo,
         device=device,
-        frame_rate=mimi.frame_rate,
-        save_voice_prompt_embeddings=save_voice_prompt_embeddings,
-        use_sampling=not greedy,
-        temp=temp_audio,
+        seed=seed,
+        temp_audio=temp_audio,
         temp_text=temp_text,
-        top_k=topk_audio,
-        top_k_text=topk_text,
+        topk_audio=topk_audio,
+        topk_text=topk_text,
+        greedy=greedy,
+        save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+        cpu_offload=cpu_offload,
     )
-    # Keep models in streaming mode similar to the server
-    mimi.streaming_forever(1)
-    other_mimi.streaming_forever(1)
-    lm_gen.streaming_forever(1)
-
-    # 5) Warmup
-    log("info", "warming up the model")
-    warmup(mimi, other_mimi, lm_gen, device, frame_size)
-
-    # 6) Prompt configuration (text + voice)
-    # System text tokens (k=0) and agent voice-prompt audio (k=1..dep_q) are forced
-    if voice_prompt_path.endswith('.pt'):
-        # Load pre-saved voice prompt embeddings
-        lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
-    else:
-        lm_gen.load_voice_prompt(voice_prompt_path)
-    lm_gen.text_prompt_tokens = (
-        text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if len(text_prompt) > 0 else None
+    generate_offline_sample(
+        session,
+        input_wav=input_wav,
+        output_wav=output_wav,
+        text_prompt=text_prompt,
+        voice_prompt_path=voice_prompt_path,
+        output_text=output_text,
+        log_tokens=True,
     )
-
-    # 7) Reset streaming and run initial prompt phases
-    #    - Voice prompt injection
-    #    - Audio silence
-    #    - Text prompt injection
-    #    - Final audio silence
-    mimi.reset_streaming()
-    other_mimi.reset_streaming()
-    lm_gen.reset_streaming()
-    lm_gen.step_system_prompts(mimi)
-    # Reset mimi streaming after voice prompt encoding
-    mimi.reset_streaming()
-
-    # 8) Load and iterate user audio frames for feeding into the input channels
-    sample_rate = mimi.sample_rate
-    user_audio = lm_load_audio(input_wav, sample_rate)  # (C, T) at model SR
-
-    # 9) Encode user audio with Mimi (same iterator logic used for voice prompts),
-    #    and step the model one frame at a time, collecting decoded PCM frames
-    generated_frames: List[np.ndarray] = []
-    generated_text_tokens: List[str] = []
-    total_target_samples = user_audio.shape[-1]
-
-    for user_encoded in lm_encode_from_sphn(
-        mimi,
-        lm_iterate_audio(
-            user_audio, sample_interval_size=lm_gen._frame_size, pad=True
-        ),
-        max_batch=1,
-    ):
-        # user_encoded: [1, K, T]. Feed one step at a time (usually T==1)
-        steps = user_encoded.shape[-1]
-        for c in range(steps):
-            step_in = user_encoded[:, :, c : c + 1]
-            # Feed user-side input channels; text + agent audio are sampled
-            tokens = lm_gen.step(step_in)
-            if tokens is None:
-                continue
-            # Decode current sampled agent frame to PCM
-            pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
-            generated_frames.append(pcm)
-            # Decode text token
-            text_token = tokens[0, 0, 0].item()
-            if text_token not in (0, 3):
-                _text = text_tokenizer.id_to_piece(text_token)  # type: ignore
-                _text = _text.replace("▁", " ")
-                log("info", f"text token '{_text}'")
-                generated_text_tokens.append(_text)
-            else:
-                text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
-                log("info", f"text token '{text_token_map[text_token]}'")
-                generated_text_tokens.append(text_token_map[text_token])
-
-    if len(generated_frames) == 0:
-        log("error", "No audio frames were generated. Check input file and configuration.")
-        return
-
-    # 10) Concatenate frames and trim/pad to match input duration
-    output_pcm = np.concatenate(generated_frames, axis=-1)
-    if output_pcm.shape[-1] > total_target_samples:
-        output_pcm = output_pcm[:total_target_samples]
-    elif output_pcm.shape[-1] < total_target_samples:
-        pad_len = total_target_samples - output_pcm.shape[-1]
-        output_pcm = np.concatenate(
-            [output_pcm, np.zeros(pad_len, dtype=output_pcm.dtype)], axis=-1
-        )
-
-    # 11) Write mono WAV at model sample rate
-    sphn.write_wav(output_wav, output_pcm, sample_rate)
-    log("info", f"Wrote output audio to {output_wav}")
-
-    # 12) Write text tokens
-    with open(output_text, "w") as file:
-        json.dump(generated_text_tokens, file, ensure_ascii=False)
-    log("info", f"Wrote output text to {output_text}")    
 
 
 def main():
